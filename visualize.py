@@ -2,7 +2,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 # 读取数据
-DIR = "out_cnn_lstm_grid_search_2/run_075/"
+DIR = "out_cnn_lstm_grid_search_5/run_002/" 
 df = pd.read_csv(DIR + "test_predictions.csv", parse_dates=["time"])
 
 # 设置时间为索引（可选）
@@ -21,5 +21,6 @@ plt.legend()
 plt.grid(True, linestyle="--", alpha=0.6)
 plt.tight_layout()
 
-plt.show()
-plt.savefig(DIR + "OT_true_vs_pred.png")
+
+plt.savefig("image/OT_true_vs_pred.png")
+plt.close()

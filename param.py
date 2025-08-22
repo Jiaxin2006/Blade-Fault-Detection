@@ -34,7 +34,7 @@ random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
 
-OUT_DIR = Path("out_cnn_lstm_grid_search_3")
+OUT_DIR = Path("out_cnn_lstm_grid_search_final")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", DEVICE)
@@ -170,8 +170,7 @@ BASE = {
 
     # other tricks
     "HUBER_DELTA": 1.0,
-    "USE_CLUSTER": True,
-    "N_CLUSTERS": 2
+    "USE_CLUSTER": True
 }
 
 # =========================
@@ -209,8 +208,8 @@ df_scaled[feat_cols] = scaler_inputs.transform(df[feat_cols].values)
 # =========================
 # Clustering (temperature only)
 # =========================
-USE_CLUSTER = BASE["USE_CLUSTER"]
-N_CLUSTERS  = BASE["N_CLUSTERS"]
+'''USE_CLUSTER = BASE["USE_CLUSTER"]
+N_CLUSTERS  = params["N_CLUSTERS"]
 
 if USE_CLUSTER:
     cluster_cols = ['exog_temp','exog_wind', 'OT_prev']  # only use temperature for clustering
@@ -238,16 +237,7 @@ else:
     df['cluster'] = -1
     df_scaled['cluster'] = -1
     print("Clustering disabled. Training one global model.")
-
-# =========================
-# Final splits (with cluster preserved)
-# =========================
-train_df = df_scaled.iloc[train_idx].reset_index(drop=True)
-val_df   = df_scaled.iloc[val_idx].reset_index(drop=True)
-test_df  = df_scaled.iloc[test_idx].reset_index(drop=True)
-
-for name, sub in [('train', train_df), ('val', val_df), ('test', test_df)]:
-    assert 'cluster' in sub.columns, f"{name}_df lost 'cluster' column!"
+'''
 
 # =========================
 # Dataset class
@@ -803,33 +793,34 @@ def asym_weight(diff, under_w):
 # =========================
 param_grid = {
     "MODEL_TYPE": [
-                   "cnn_lstm_mlp"
+                   "cnn_lstm_attn","cnn_lstm_mlp"
     ],   # <- expanded
-    "SEQ_LEN": [4],
+    "SEQ_LEN": [2,4],
 
     # common training
-    "LR": [5e-4, 3e-4, 2e-4, 1e-4],
-    "BATCH_SIZE": [16, 8],
+    "LR": [3e-4],
+    "BATCH_SIZE": [16],
     "WEIGHT_DECAY": [0.0],
-    "DROPOUT": [0.05, 0.0],
+    "DROPOUT": [0.0],
 
     # model sizes
-    "CNN_CHANNELS": [32, 64],
+    "CNN_CHANNELS": [16],
     "CNN_KERNEL": [3],
-    "LSTM_HID": [128, 256],
+    "LSTM_HID": [128],
     "MLP_HIDDEN": [96],
-    # "NUM_TRANS_LAYERS": [0, 1],   # only used for cnn_lstm_attn
+    "NUM_TRANS_LAYERS": [1,2],   # only used for cnn_lstm_attn
 
     # loss configs
-    "LOSS_TYPE": ["mae", "huber", "smape"],
+    "LOSS_TYPE": ["smape"], # "mae", "huber", 
     "USE_HET": [True],
     "USE_ASYM": [True],
     "ASYM_W": [1.0],
 
     # data tricks
     "OVERSAMPLE_PEAKS": [True],
+    "N_CLUSTERS": [1,2,3,4,5]
 }
-max_runs = 100  # hard cap
+max_runs = 40  # hard cap
 
 # =========================
 # Train + Eval per run (per cluster)
@@ -1107,6 +1098,7 @@ def train_and_eval(run_id, params):
         "USE_ASYM": cfg["USE_ASYM"],
         "ASYM_W": cfg["ASYM_W"],
         "OVERSAMPLE_PEAKS": cfg["OVERSAMPLE_PEAKS"],
+        "N_CLUSTERS": cfg["N_CLUSTERS"],
         **metrics
     }
     return summary
@@ -1125,6 +1117,39 @@ if len(all_combos) > max_runs:
 results = []
 for rid, combo in enumerate(all_combos):
     params = dict(zip(all_keys, combo))
+    # =========================
+    # Final splits (with cluster preserved)
+    # =========================
+
+    N_CLUSTERS = params["N_CLUSTERS"]
+    cluster_cols = ['exog_temp','exog_wind', 'OT_prev']  # only use temperature for clustering
+    scaler_cluster = StandardScaler().fit(df.iloc[train_idx][cluster_cols].values)
+
+    Xc_train = scaler_cluster.transform(df.iloc[train_idx][cluster_cols].values)
+    kmeans = KMeans(n_clusters=N_CLUSTERS, random_state=SEED, n_init=20).fit(Xc_train)
+
+    Xc_full = scaler_cluster.transform(df[cluster_cols].values)
+    clusters = kmeans.predict(Xc_full)
+
+    # attach cluster to both df and df_scaled
+    df['cluster'] = clusters
+    df_scaled['cluster'] = clusters
+
+    joblib.dump(scaler_cluster, OUT_DIR/'scaler_cluster.joblib')
+    joblib.dump(kmeans, OUT_DIR/'kmeans.joblib')
+
+    print("Clustering enabled. Unique clusters:", sorted(np.unique(clusters)))
+    print("Train cluster counts:\n", df.loc[train_idx, 'cluster'].value_counts().sort_index())
+    print("Val   cluster counts:\n", df.loc[val_idx, 'cluster'].value_counts().sort_index())
+    print("Test  cluster counts:\n", df.loc[test_idx, 'cluster'].value_counts().sort_index())
+
+    train_df = df_scaled.iloc[train_idx].reset_index(drop=True)
+    val_df   = df_scaled.iloc[val_idx].reset_index(drop=True)
+    test_df  = df_scaled.iloc[test_idx].reset_index(drop=True)
+
+    for name, sub in [('train', train_df), ('val', val_df), ('test', test_df)]:
+        assert 'cluster' in sub.columns, f"{name}_df lost 'cluster' column!"
+
     # seed per run
     random.seed(SEED + rid); np.random.seed(SEED + rid); torch.manual_seed(SEED + rid)
     if torch.cuda.is_available(): torch.cuda.manual_seed_all(SEED + rid)

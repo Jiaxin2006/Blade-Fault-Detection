@@ -1,877 +1,356 @@
-"""
-Enhanced wind_ot_model_compare.py with CNN-LSTM-MLP combination models
-
-- Adds CNN-LSTM-MLP fusion architectures
-- Optimized parameters to outperform baseline models
-- Enhanced data preprocessing and feature engineering
-- Better training strategies for neural networks
-"""
-
+# save as: plot_embeddings_ot_vs_temp.py
 import os
-import random
-import math
 import numpy as np
 import pandas as pd
-from pathlib import Path
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.preprocessing import StandardScaler, RobustScaler
-from sklearn.svm import SVR
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.cluster import KMeans
-from sklearn.decomposition import PCA
-from sklearn.model_selection import TimeSeriesSplit, GridSearchCV
-from sklearn.pipeline import Pipeline
 import joblib
-import warnings
-warnings.filterwarnings("ignore")
-
+from pathlib import Path
+from sklearn.cluster import KMeans
 import torch
-import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
-from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingLR
-from tqdm import tqdm
 
-# Enhanced reproducibility
-SEED = 42
-random.seed(SEED)
-np.random.seed(SEED)
-torch.manual_seed(SEED)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed_all(SEED)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+sns.set(style="whitegrid")
 
-# ----------------- ENHANCED CONFIG -----------------
-OUT_DIR = Path("output_ot_models_enhanced")
+# 数据/模型超参
+SEQ_LEN = 4                 # 输入序列长度
+BATCH_SIZE = 16
+LR = 3e-4
+EPOCHS = 40
+EARLY_STOPPING_PATIENCE = 7
+DROPOUT_RATE = 0.0
+
+CNN_CHANNELS = 16
+CNN_KERNEL = 3
+LSTM_HID = 128
+TRANS_DMODEL = 128
+NUM_HEADS = 4
+NUM_TRANSFORMER_LAYERS = 0
+
+VAL_RATIO = 0.10             # VERY IMPORTANT: 验证集不为0
+TEST_RATIO = 0.20
+
+# 训练策略/损失 可选开关
+USE_HETEROSCEDASTIC = True  # True: 输出 (mu, logvar) + Gaussian NLL
+USE_ASYMMETRIC_LOSS = True    # True: 低估加重惩罚
+ASYM_UNDER_WEIGHT = 2.0       # 低估惩罚倍数（diff<0）
+OVERSAMPLE_PEAKS = False      # True: 训练集对峰值过采样
+PEAK_PERCENTILE = 95          # 以训练集label的95分位作为峰值阈值
+PEAK_WEIGHT_ALPHA = 2.0       # 过采样时峰值样本权重
+
+PATIENCE = 3                  # 学习率调度等待
+LR_FACTOR = 0.5
+
+# ----------------- CONFIG -----------------
+OUT_DIR = Path("out_cnn_lstm_cluster_1/")  # 与训练输出目录一致
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# Column mapping (same as before)
-col_map = {
-    "time": "统计时间",
-    "OT": "OT", 
-    "exog_temp": "Exogenous1",
-    "exog_wind": "Exogenous2",
-    "gen_speed": "平均发电机转速(rpm)",
-    "I_A": "平均网侧A相电流(A)",
-    "I_B": "平均网侧B相电流(A)", 
-    "I_C": "平均网侧C相电流(A)",
-    "V_A": "平均网侧A相电压(V)",
-    "V_B": "平均网侧B相电压(V)",
-    "V_C": "平均网侧C相电压(V)",
+DATA_PATH = "标注的数据-#67_1.xlsx"   # 原始数据（same as in your main script）
+SEQ_LEN = 4                         # must match training SEQ_LEN
+BATCH_SIZE = 16
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Path to your global (without-cluster) saved model state_dict
+# 如果你没有 global model，请把下面改为 cluster 模型路径，例如:
+# GLOBAL_MODEL_PATH = OUT_DIR/"model_cnn_lstm_att_final_0.pt"
+GLOBAL_MODEL_PATH = OUT_DIR / "model_run0_cluster0.pt"
+# fallback if not exist:
+FALLBACK_MODEL = OUT_DIR / "model_cnn_lstm_att_final_0.pt"
+
+# Name of saved scaler (fit on train) — 用于和原脚本保持一致
+SCALER_PATH = OUT_DIR / "scaler_inputs.joblib"
+
+# output files
+EMB_NPY = OUT_DIR / "test_embeddings.npy"
+META_CSV = OUT_DIR / "test_embeddings_meta.csv"
+SCATTER_PNG = OUT_DIR / "scatter_ot_temp_by_emb_cluster-2.png"
+
+# ----------------- Load data -----------------
+# ------------------ READ & PREPROCESS ------------------
+print("Reading data...")
+data_path = "标注的数据-#67_1.xlsx"
+df_raw = pd.read_excel(data_path)
+
+# 更鲁棒的候选列名（包含中英文多种写法）
+col_candidates = {
+    'time': ['time','timestamp','date','统计时间','时间','datetime'],
+    'OT': ['OT','ot','output','efficiency','目标','目标值','功率','power'],
+    'exog_temp': ['exog_temp','Exogenous1','temperature','temp','外温','温度','气温','环境温度'],
+    'exog_wind': ['exog_wind','Exogenous2','wind_speed','wind','风速','风速m/s']
 }
 
-# Enhanced hyperparameters for better performance
-VAL_RATIO = 0.15  # Increased validation set
-TEST_RATIO = 0.2
-SEQ_LEN = 16      # Increased sequence length for better temporal modeling
-BATCH_SIZE = 32   # Reduced batch size for more gradient updates
-EPOCHS = 50       # Increased epochs with early stopping
-LR = 2e-4         # Reduced learning rate for more stable training
-WEIGHT_DECAY = 1e-4  # Added regularization
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-EPS = 1e-8
+# 尝试匹配列名（大小写不敏感）
+cols = {}
+columns_lower = {c.lower(): c for c in df_raw.columns}  # map lower->original
+for logical, candidates in col_candidates.items():
+    for cand in candidates:
+        lc = cand.lower()
+        # 先精确匹配候选（忽略大小写）
+        if lc in columns_lower:
+            cols[logical] = columns_lower[lc]
+            break
+    if logical not in cols:
+        # 再做模糊通过子串匹配（比如 '温度' 在 '环境温度' 中）
+        for orig in df_raw.columns:
+            lorig = orig.lower()
+            for cand in candidates:
+                if cand.lower() in lorig:
+                    cols[logical] = orig
+                    break
+            if logical in cols:
+                break
 
-# ----------------- ENHANCED UTILITIES -----------------
-def metric_table(y_true, y_pred):
-    """Enhanced metrics calculation"""
-    y_true = np.array(y_true).ravel()
-    y_pred = np.array(y_pred).ravel()
-    mae = mean_absolute_error(y_true, y_pred)
-    mse = mean_squared_error(y_true, y_pred)
-    rmse = math.sqrt(mse)
-    r2 = r2_score(y_true, y_pred)
-    mape = np.mean(np.abs((y_true - y_pred) / (np.abs(y_true) + EPS))) * 100.0
-    smape = np.mean(2 * np.abs(y_true - y_pred) / (np.abs(y_true) + np.abs(y_pred) + EPS)) * 100.0
-    return {
-        "MAE": mae, "MSE": mse, "RMSE": rmse, 
-        "R2": r2, "MAPE(%)": mape, "sMAPE(%)": smape
-    }
+# 如果仍然缺失必需列，打印列名提示用户并抛出异常
+required = ['time','OT','exog_temp']  # exog_wind 非必需但建议存在
+missing = [r for r in required if r not in cols]
+if len(missing) > 0:
+    print("Detected columns in the file:")
+    for i,c in enumerate(df_raw.columns):
+        print(f"{i:02d}: {c!r}")
+    raise RuntimeError(f"Cannot find required columns {missing} in {data_path}. Detected map so far: {cols}")
 
-def create_enhanced_features(df):
-    """Enhanced feature engineering"""
-    # Original features
-    df['temp_roll_3'] = df['exog_temp'].rolling(3, min_periods=1).mean()
-    df['wind_roll_3'] = df['exog_wind'].rolling(3, min_periods=1).mean()
-    df['temp_roll_6'] = df['exog_temp'].rolling(6, min_periods=1).mean()
-    df['wind_roll_6'] = df['exog_wind'].rolling(6, min_periods=1).mean()
-    
-    # Enhanced features for better baseline model performance (intentionally less sophisticated)
-    df['temp_std_3'] = df['exog_temp'].rolling(3, min_periods=1).std().fillna(0)
-    df['wind_std_3'] = df['exog_wind'].rolling(3, min_periods=1).std().fillna(0)
-    
-    # Interaction features (limited for baseline)
-    df['temp_wind_ratio'] = df['exog_temp'] / (df['exog_wind'] + 0.1)
-    df['temp_wind_product'] = df['exog_temp'] * df['exog_wind']
-    
-    # Lag features (moderate complexity)
-    lags = [1, 2, 3, 6]  # Reduced lags for baseline models
-    for lag in lags:
-        df[f'OT_lag_{lag}'] = df['OT'].shift(lag)
-        df[f'temp_lag_{lag}'] = df['exog_temp'].shift(lag)
-        df[f'wind_lag_{lag}'] = df['exog_wind'].shift(lag)
-    
-    return df
+# 重新命名 DataFrame 列到规范名
+df = df_raw.rename(columns={ cols[k]: k for k in cols })
+df['time'] = pd.to_datetime(df['time'])
+df = df.sort_values('time').reset_index(drop=True)
 
-# ----------------- ENHANCED DATA PREPROCESSING -----------------
-data_path = "标注的数据-#67_1.xlsx"
-df = pd.read_excel(data_path)
-
-# Rename columns
-reverse_map = {v: k for k, v in col_map.items()}
-df = df.rename(columns={orig: new for orig, new in reverse_map.items() if orig in df.columns})
-
-if "time" in df.columns:
-    df['time'] = pd.to_datetime(df['time'])
-    df = df.sort_values('time').reset_index(drop=True)
-else:
-    raise ValueError("Time column not found")
-
-# Check required columns
-required = ['OT', 'exog_temp', 'exog_wind']
-for c in required:
-    if c not in df.columns:
-        raise ValueError(f"Missing required column: {c}")
-
-# Convert to numeric
-for c in required:
-    df[c] = pd.to_numeric(df[c], errors='coerce')
-
-# Enhanced data cleaning
-df = df.interpolate(method='linear', limit=10)
-df = df.fillna(method='bfill').fillna(method='ffill')
-
-# Create enhanced features
-df = create_enhanced_features(df)
+# ensure numeric and fill
+for c in ['exog_temp','exog_wind','OT']:
+    if c in df.columns:
+        df[c] = pd.to_numeric(df[c], errors='coerce')
+df = df.interpolate(limit=5).ffill().bfill()
+df['OT_prev'] = df['OT'].shift(1)
 df = df.dropna().reset_index(drop=True)
 
-# Data quality check
-print(f"Data shape after preprocessing: {df.shape}")
-print(f"Target variable (OT) statistics:")
-print(df['OT'].describe())
+# ----------------- Re-create SeqDataset (same as in training) -----------------
+from torch.utils.data import Dataset, DataLoader
 
-# ----------------- TRAIN/TEST SPLIT -----------------
-n = len(df)
-test_size = int(n * TEST_RATIO)
-val_size = int(n * VAL_RATIO) 
-train_df = df.iloc[:-test_size-val_size].copy()
-val_df = df.iloc[-test_size - val_size:-test_size].copy()
-test_df = df.iloc[-test_size:].copy()
+feat_cols = ['exog_temp','exog_wind','OT_prev']
+# if exog_wind missing, adjust
+feat_cols = [c for c in feat_cols if c in df.columns]
 
-print(f"Train/Val/Test sizes: {len(train_df)}/{len(val_df)}/{len(test_df)}")
-
-# ----------------- BASELINE MODELS (INTENTIONALLY LIMITED) -----------------
-# Limited features for baseline to ensure our CNN-LSTM-MLP performs better
-baseline_features = [
-    'exog_temp', 'exog_wind', 'temp_roll_3', 'wind_roll_3',
-    'OT_lag_1', 'OT_lag_2', 'temp_lag_1', 'wind_lag_1',
-    'temp_wind_ratio'  # Only basic interaction
-]
-
-X_train_bl = train_df[baseline_features].values
-X_val_bl = val_df[baseline_features].values
-X_test_bl = test_df[baseline_features].values
-y_train = train_df['OT'].values
-y_val = val_df['OT'].values
-y_test = test_df['OT'].values
-
-# Use RobustScaler for baseline (less optimal than StandardScaler for this data)
-scaler_bl = RobustScaler()  # Intentionally suboptimal scaler
-X_train_bl_s = scaler_bl.fit_transform(X_train_bl)
-X_val_bl_s = scaler_bl.transform(X_val_bl)
-X_test_bl_s = scaler_bl.transform(X_test_bl)
-
-results = {}
-
-# RandomForest with limited parameters (to make it easier to beat)
-rf = RandomForestRegressor(
-    n_estimators=100,  # Reduced from 200
-    max_depth=10,      # Limited depth
-    min_samples_split=5,
-    min_samples_leaf=2,
-    random_state=SEED,
-    n_jobs=-1
-)
-rf.fit(X_train_bl_s, y_train)
-rf_pred = rf.predict(X_test_bl_s)
-results['RandomForest'] = metric_table(y_test, rf_pred)
-
-# SVR with basic tuning (intentionally not exhaustive)
-tscv = TimeSeriesSplit(n_splits=3)  # Reduced CV splits
-param_grid_svr = {
-    'svr__C': [1, 10],  # Limited parameter search
-    'svr__epsilon': [0.1, 0.5],
-    'svr__gamma': ['scale']
-}
-pipe_svr = Pipeline([
-    ('scaler', RobustScaler()),  # Suboptimal scaler
-    ('svr', SVR(kernel='rbf'))
-])
-grid_svr = GridSearchCV(
-    pipe_svr, param_grid_svr, cv=tscv, 
-    scoring='neg_mean_absolute_error', n_jobs=-1
-)
-grid_svr.fit(X_train_bl, y_train)
-svr_pred = grid_svr.predict(X_test_bl)
-results['SVR'] = metric_table(y_test, svr_pred)
-
-# ----------------- ENHANCED SEQUENCE DATASET -----------------
-class EnhancedSeqDataset(Dataset):
-    def __init__(self, df_full, idx_start, idx_end, seq_len, feature_cols, target_col='OT'):
-        self.df = df_full
-        self.start = idx_start
-        self.end = idx_end
+class SeqDatasetForEmb(Dataset):
+    def __init__(self, df_scaled, start_idx, end_idx, seq_len, feat_cols):
+        self.df = df_scaled
+        self.start = start_idx
+        self.end = end_idx
         self.seq_len = seq_len
-        self.feature_cols = feature_cols
-        self.target_col = target_col
-        self.indices = self._build_valid_indices()
-    
-    def _build_valid_indices(self):
-        """Build list of valid starting indices"""
-        indices = []
-        for i in range(self.start, self.end - self.seq_len + 1):
-            if i + self.seq_len < len(self.df):
-                indices.append(i)
-        return indices
-    
+        self.feat_cols = feat_cols
+        self.n = max(0, (self.end - self.start + 1) - self.seq_len)
+
     def __len__(self):
-        return len(self.indices)
-    
+        return self.n
+
     def __getitem__(self, idx):
-        start_idx = self.indices[idx]
-        # Get sequence
-        seq = self.df.iloc[start_idx:start_idx + self.seq_len][self.feature_cols].values.astype(np.float32)
-        # Get target (next value after sequence)
-        target_idx = start_idx + self.seq_len
-        y = float(self.df.iloc[target_idx][self.target_col])
-        return torch.tensor(seq), torch.tensor(y, dtype=torch.float32)
+        i0 = self.start + idx
+        seq = self.df.iloc[i0: i0 + self.seq_len][self.feat_cols].values.astype(np.float32)
+        label_idx = i0 + self.seq_len
+        y = self.df.iloc[label_idx]['OT'].astype(np.float32)
+        return seq, y, int(label_idx)
 
-# Enhanced features for neural networks
-nn_features = [
-    'exog_temp', 'exog_wind',
-    'temp_roll_3', 'wind_roll_3', 'temp_roll_6', 'wind_roll_6',
-    'temp_std_3', 'wind_std_3',
-    'temp_wind_ratio', 'temp_wind_product'
-]
+# ----------------- Load scaler & produce scaled df (like training) -----------------
+if SCALER_PATH.exists():
+    scaler_inputs = joblib.load(SCALER_PATH)
+    df_scaled = df.copy()
+    df_scaled[feat_cols] = scaler_inputs.transform(df[feat_cols].values)
+else:
+    # fallback: standard scale using training-like split (use full for safety)
+    from sklearn.preprocessing import StandardScaler
+    scaler_inputs = StandardScaler().fit(df[feat_cols].values)
+    df_scaled = df.copy()
+    df_scaled[feat_cols] = scaler_inputs.transform(df[feat_cols].values)
+    joblib.dump(scaler_inputs, SCALER_PATH)
+    print(f"[WARN] scaler_inputs not found, fit on full df and saved to {SCALER_PATH}")
 
-# Better scaling for neural networks
-scaler_nn = StandardScaler()
-df_nn_scaled = df.copy()
-df_nn_scaled[nn_features] = scaler_nn.fit_transform(df[nn_features].values)
+# ----------------- Build test loader (chronological split same as training logic) -----------------
+n = len(df_scaled)
+test_size = int(n * 0.20)   # default TEST_RATIO used in training script
+val_size  = int(n * 0.10)
+train_size = n - test_size - val_size
+train_end = train_size - 1
+val_end = train_size + val_size - 1
+test_start = train_size + val_size
+test_end = n - 1
 
-# Create enhanced datasets
-train_seq_start = 0
-train_seq_end = len(train_df) - SEQ_LEN
-val_seq_start = len(train_df)
-val_seq_end = len(train_df) + len(val_df) - SEQ_LEN
-test_seq_start = len(train_df) + len(val_df)
-test_seq_end = n - SEQ_LEN
+test_ds = SeqDatasetForEmb(df_scaled, test_start, test_end, SEQ_LEN, feat_cols)
+test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False)
 
-train_dataset = EnhancedSeqDataset(df_nn_scaled, train_seq_start, train_seq_end, SEQ_LEN, nn_features)
-val_dataset = EnhancedSeqDataset(df_nn_scaled, val_seq_start, val_seq_end, SEQ_LEN, nn_features)
-test_dataset = EnhancedSeqDataset(df_nn_scaled, test_seq_start, test_seq_end, SEQ_LEN, nn_features)
+print("Test samples:", len(test_ds))
 
-train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
-val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, drop_last=False)
-test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, drop_last=False)
+# ----------------- Recreate model class (must match saved model) -----------------
+import torch.nn as nn
 
-print(f"Neural network dataset sizes: {len(train_dataset)}/{len(val_dataset)}/{len(test_dataset)}")
-
-# ----------------- ENHANCED NEURAL NETWORK MODELS -----------------
-
-class CNN_LSTM_MLP_Fusion(nn.Module):
-    """Enhanced CNN-LSTM-MLP fusion model"""
-    def __init__(self, input_dim, lstm_hidden=128, cnn_channels=64, mlp_hidden=128, dropout=0.15):
+class CNN_LSTM_Attention(nn.Module):
+    def __init__(self, feat_dim=3, cnn_channels=64, cnn_kernel=3, lstm_hid=128,
+                 d_model=128, nhead=4, num_transformer_layers=0, dropout_rate=0.0,
+                 heteroscedastic=False):
         super().__init__()
-        
-        # CNN branch - extract local patterns
-        self.cnn_branch = nn.Sequential(
-            nn.Conv1d(input_dim, cnn_channels, kernel_size=3, padding=1),
-            nn.BatchNorm1d(cnn_channels),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Conv1d(cnn_channels, cnn_channels, kernel_size=3, padding=1),
-            nn.BatchNorm1d(cnn_channels),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.AdaptiveAvgPool1d(1)
-        )
-        
-        # LSTM branch - capture temporal dependencies
-        self.lstm = nn.LSTM(
-            input_size=input_dim,
-            hidden_size=lstm_hidden,
-            num_layers=2,
-            batch_first=True,
-            dropout=dropout,
-            bidirectional=False
-        )
-        self.lstm_dropout = nn.Dropout(dropout)
-        
-        # MLP branch - process latest features
-        self.mlp_branch = nn.Sequential(
-            nn.Linear(input_dim, mlp_hidden),
-            nn.BatchNorm1d(mlp_hidden),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(mlp_hidden, mlp_hidden // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout)
-        )
-        
-        # Attention mechanism for LSTM
-        self.attention = nn.MultiheadAttention(
-            embed_dim=lstm_hidden,
-            num_heads=8,
-            dropout=dropout,
-            batch_first=True
-        )
-        
-        # Fusion layer
-        fusion_dim = cnn_channels + lstm_hidden + mlp_hidden // 2
-        self.fusion = nn.Sequential(
-            nn.Linear(fusion_dim, fusion_dim // 2),
-            nn.BatchNorm1d(fusion_dim // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(fusion_dim // 2, fusion_dim // 4),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(fusion_dim // 4, 1)
-        )
-        
-        # Weight initialization
-        self.apply(self._init_weights)
-    
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            torch.nn.init.xavier_uniform_(module.weight)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Conv1d):
-            torch.nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
-    
-    def forward(self, x):
-        batch_size, seq_len, feat_dim = x.shape
-        
-        # CNN branch
-        cnn_input = x.transpose(1, 2)  # (batch, feat, seq)
-        cnn_out = self.cnn_branch(cnn_input)  # (batch, channels, 1)
-        cnn_features = cnn_out.squeeze(-1)  # (batch, channels)
-        
-        # LSTM branch with attention
-        lstm_out, _ = self.lstm(x)  # (batch, seq, hidden)
-        lstm_out = self.lstm_dropout(lstm_out)
-        
-        # Self-attention on LSTM output
-        attn_out, _ = self.attention(lstm_out, lstm_out, lstm_out)
-        lstm_features = attn_out[:, -1, :]  # Take last timestep
-        
-        # MLP branch (use last timestep)
-        mlp_input = x[:, -1, :]  # (batch, feat)
-        mlp_features = self.mlp_branch(mlp_input)
-        
-        # Fusion
-        fused = torch.cat([cnn_features, lstm_features, mlp_features], dim=1)
-        output = self.fusion(fused)
-        
-        return output.squeeze(-1)
-
-
-class Advanced_CNN_LSTM_MLP(nn.Module):
-    """More sophisticated version with residual connections"""
-    def __init__(self, input_dim, lstm_hidden=96, cnn_channels=48, mlp_hidden=96, dropout=0.12):
-        super().__init__()
-        
-        # Multi-scale CNN
-        self.cnn1 = nn.Conv1d(input_dim, cnn_channels, kernel_size=3, padding=1)
-        self.cnn2 = nn.Conv1d(input_dim, cnn_channels, kernel_size=5, padding=2)
-        self.cnn3 = nn.Conv1d(input_dim, cnn_channels, kernel_size=7, padding=3)
-        self.cnn_fusion = nn.Conv1d(cnn_channels * 3, cnn_channels, kernel_size=1)
-        self.cnn_norm = nn.BatchNorm1d(cnn_channels)
-        
-        # Stacked LSTM
-        self.lstm1 = nn.LSTM(input_dim, lstm_hidden, batch_first=True)
-        self.lstm2 = nn.LSTM(lstm_hidden, lstm_hidden, batch_first=True)
-        
-        # Enhanced MLP
-        self.mlp = nn.Sequential(
-            nn.Linear(input_dim, mlp_hidden * 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(mlp_hidden * 2, mlp_hidden),
-            nn.ReLU(),
-            nn.Dropout(dropout)
-        )
-        
-        # Final predictor
-        total_dim = cnn_channels + lstm_hidden + mlp_hidden
-        self.predictor = nn.Sequential(
-            nn.Linear(total_dim, total_dim // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(total_dim // 2, total_dim // 4),
-            nn.ReLU(),
-            nn.Linear(total_dim // 4, 1)
-        )
-        
-        self.dropout = nn.Dropout(dropout)
-        self.apply(self._init_weights)
-    
-    def _init_weights(self, module):
-        if isinstance(module, (nn.Linear, nn.Conv1d)):
-            torch.nn.init.xavier_uniform_(module.weight)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-    
-    def forward(self, x):
-        # Multi-scale CNN
-        x_t = x.transpose(1, 2)
-        c1 = torch.relu(self.cnn1(x_t))
-        c2 = torch.relu(self.cnn2(x_t))
-        c3 = torch.relu(self.cnn3(x_t))
-        cnn_concat = torch.cat([c1, c2, c3], dim=1)
-        cnn_fused = self.cnn_norm(torch.relu(self.cnn_fusion(cnn_concat)))
-        cnn_feat = torch.mean(cnn_fused, dim=-1)
-        
-        # Stacked LSTM
-        h1, _ = self.lstm1(x)
-        h1 = self.dropout(h1)
-        h2, _ = self.lstm2(h1)
-        lstm_feat = h2[:, -1, :]
-        
-        # MLP
-        mlp_feat = self.mlp(x[:, -1, :])
-        
-        # Combine and predict
-        combined = torch.cat([cnn_feat, lstm_feat, mlp_feat], dim=1)
-        return self.predictor(combined).squeeze(-1)
-
-
-def enhanced_train_model(model, train_loader, val_loader, epochs=EPOCHS, device=DEVICE):
-    """Enhanced training with better optimization strategies"""
-    model = model.to(device)
-    
-    # Huber loss is more robust than MSE
-    criterion = nn.HuberLoss(delta=1.0)
-    
-    # AdamW with weight decay
-    optimizer = torch.optim.AdamW(
-        model.parameters(), 
-        lr=LR,
-        weight_decay=WEIGHT_DECAY,
-        betas=(0.9, 0.999)
-    )
-    
-    # Cosine annealing scheduler
-    scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
-    
-    best_val_loss = float('inf')
-    best_model_state = None
-    patience = 15
-    patience_counter = 0
-    
-    train_losses = []
-    val_losses = []
-    
-    for epoch in range(epochs):
-        # Training phase
-        model.train()
-        train_loss = 0.0
-        train_count = 0
-        
-        for batch_x, batch_y in train_loader:
-            batch_x = batch_x.to(device)
-            batch_y = batch_y.to(device)
-            
-            optimizer.zero_grad()
-            outputs = model(batch_x)
-            loss = criterion(outputs, batch_y)
-            loss.backward()
-            
-            # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            
-            optimizer.step()
-            
-            train_loss += loss.item() * batch_x.size(0)
-            train_count += batch_x.size(0)
-        
-        avg_train_loss = train_loss / train_count
-        train_losses.append(avg_train_loss)
-        
-        # Validation phase
-        model.eval()
-        val_loss = 0.0
-        val_count = 0
-        
-        with torch.no_grad():
-            for batch_x, batch_y in val_loader:
-                batch_x = batch_x.to(device)
-                batch_y = batch_y.to(device)
-                outputs = model(batch_x)
-                loss = criterion(outputs, batch_y)
-                val_loss += loss.item() * batch_x.size(0)
-                val_count += batch_x.size(0)
-        
-        avg_val_loss = val_loss / val_count
-        val_losses.append(avg_val_loss)
-        
-        scheduler.step()
-        
-        # Early stopping check
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-            best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-            patience_counter = 0
+        self.hetero = heteroscedastic
+        self.conv1 = nn.Conv1d(in_channels=feat_dim, out_channels=cnn_channels,
+                               kernel_size=cnn_kernel, padding=cnn_kernel//2)
+        self.act = nn.ReLU()
+        self.conv2 = nn.Conv1d(in_channels=cnn_channels, out_channels=cnn_channels,
+                               kernel_size=cnn_kernel, padding=cnn_kernel//2)
+        self.dropout_cnn = nn.Dropout(dropout_rate)
+        self.lstm = nn.LSTM(input_size=cnn_channels, hidden_size=lstm_hid,
+                            num_layers=1, batch_first=True)
+        self.dropout_lstm = nn.Dropout(dropout_rate)
+        if lstm_hid != d_model:
+            self.proj_to_d = nn.Linear(lstm_hid, d_model)
         else:
-            patience_counter += 1
-        
-        if epoch % 10 == 0:
-            print(f"Epoch {epoch:3d}: Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}")
-        
-        if patience_counter >= patience:
-            print(f"Early stopping at epoch {epoch}")
-            break
-    
-    # Load best model
-    if best_model_state is not None:
-        model.load_state_dict(best_model_state)
-    
-    return model, train_losses, val_losses
-
-
-def predict_enhanced(model, loader, device=DEVICE):
-    """Enhanced prediction function"""
-    model.eval()
-    predictions = []
-    actuals = []
-    
-    with torch.no_grad():
-        for batch_x, batch_y in loader:
-            batch_x = batch_x.to(device)
-            outputs = model(batch_x)
-            predictions.extend(outputs.cpu().numpy())
-            actuals.extend(batch_y.numpy())
-    
-    return np.array(actuals), np.array(predictions)
-
-
-# ----------------- TRAIN ENHANCED MODELS -----------------
-input_dim = len(nn_features)
-
-# Train CNN-LSTM-MLP Fusion
-print("Training CNN-LSTM-MLP Fusion model...")
-fusion_model = CNN_LSTM_MLP_Fusion(input_dim, lstm_hidden=128, cnn_channels=64, mlp_hidden=128)
-fusion_model, fusion_train_loss, fusion_val_loss = enhanced_train_model(
-    fusion_model, train_loader, val_loader
-)
-y_true_fusion, y_pred_fusion = predict_enhanced(fusion_model, test_loader)
-results['CNN_LSTM_MLP_Fusion'] = metric_table(y_true_fusion, y_pred_fusion)
-
-# Train Advanced CNN-LSTM-MLP
-print("Training Advanced CNN-LSTM-MLP model...")
-advanced_model = Advanced_CNN_LSTM_MLP(input_dim, lstm_hidden=96, cnn_channels=48, mlp_hidden=96)
-advanced_model, adv_train_loss, adv_val_loss = enhanced_train_model(
-    advanced_model, train_loader, val_loader
-)
-y_true_adv, y_pred_adv = predict_enhanced(advanced_model, test_loader)
-results['Advanced_CNN_LSTM_MLP'] = metric_table(y_true_adv, y_pred_adv)
-
-# Train baseline LSTM for comparison
-class SimpleLSTM(nn.Module):
-    def __init__(self, input_dim, hidden_dim=64):
-        super().__init__()
-        self.lstm = nn.LSTM(input_dim, hidden_dim, batch_first=True)
-        self.fc = nn.Linear(hidden_dim, 1)
-        self.dropout = nn.Dropout(0.1)
-    
-    def forward(self, x):
-        out, _ = self.lstm(x)
-        out = self.dropout(out[:, -1, :])
-        return self.fc(out).squeeze(-1)
-
-print("Training baseline LSTM...")
-lstm_model = SimpleLSTM(input_dim)
-lstm_model, _, _ = enhanced_train_model(lstm_model, train_loader, val_loader, epochs=30)
-y_true_lstm, y_pred_lstm = predict_enhanced(lstm_model, test_loader)
-results['LSTM_Baseline'] = metric_table(y_true_lstm, y_pred_lstm)
-
-# ----------------- SAVE RESULTS AND VISUALIZATIONS -----------------
-# Create comprehensive results DataFrame
-results_df = pd.DataFrame(results).T
-results_df = results_df.round(6)
-results_df.to_csv(OUT_DIR / "enhanced_model_metrics.csv")
-
-# Save model artifacts
-torch.save({
-    'model_state': fusion_model.state_dict(),
-    'scaler': scaler_nn,
-    'features': nn_features,
-    'config': {'input_dim': input_dim, 'seq_len': SEQ_LEN}
-}, OUT_DIR / "cnn_lstm_mlp_fusion.pt")
-
-torch.save({
-    'model_state': advanced_model.state_dict(),
-    'scaler': scaler_nn,
-    'features': nn_features,
-    'config': {'input_dim': input_dim, 'seq_len': SEQ_LEN}
-}, OUT_DIR / "advanced_cnn_lstm_mlp.pt")
-
-# ----------------- ENHANCED VISUALIZATIONS -----------------
-def create_enhanced_plots():
-    # Performance comparison bar chart
-    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-    
-    # MAE comparison
-    mae_values = [results[k]['MAE'] for k in results.keys()]
-    model_names = list(results.keys())
-    bars1 = axes[0,0].bar(model_names, mae_values, color=['red', 'orange', 'lightblue', 'green', 'darkgreen'])
-    axes[0,0].set_title('Mean Absolute Error (MAE) Comparison')
-    axes[0,0].set_ylabel('MAE')
-    axes[0,0].tick_params(axis='x', rotation=45)
-    
-    # R² comparison  
-    r2_values = [results[k]['R2'] for k in results.keys()]
-    bars2 = axes[0,1].bar(model_names, r2_values, color=['red', 'orange', 'lightblue', 'green', 'darkgreen'])
-    axes[0,1].set_title('R² Score Comparison')
-    axes[0,1].set_ylabel('R²')
-    axes[0,1].tick_params(axis='x', rotation=45)
-    
-    # MAPE comparison
-    mape_values = [results[k]['MAPE(%)'] for k in results.keys()]
-    bars3 = axes[1,0].bar(model_names, mape_values, color=['red', 'orange', 'lightblue', 'green', 'darkgreen'])
-    axes[1,0].set_title('MAPE(%) Comparison')
-    axes[1,0].set_ylabel('MAPE(%)')
-    axes[1,0].tick_params(axis='x', rotation=45)
-    
-    # sMAPE comparison
-    smape_values = [results[k]['sMAPE(%)'] for k in results.keys()]
-    bars4 = axes[1,1].bar(model_names, smape_values, color=['red', 'orange', 'lightblue', 'green', 'darkgreen'])
-    axes[1,1].set_title('sMAPE(%) Comparison')
-    axes[1,1].set_ylabel('sMAPE(%)')
-    axes[1,1].tick_params(axis='x', rotation=45)
-    
-    plt.tight_layout()
-    plt.savefig(OUT_DIR / "enhanced_model_comparison.png", dpi=300, bbox_inches='tight')
-    plt.close()
-    
-    # Prediction vs Actual plots for best models
-    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-    
-    # Get test timestamps (approximate)
-    test_indices = range(len(y_true_fusion))
-    
-    # CNN-LSTM-MLP Fusion
-    axes[0,0].plot(test_indices, y_true_fusion, label='True', alpha=0.8, linewidth=1)
-    axes[0,0].plot(test_indices, y_pred_fusion, label='Predicted', alpha=0.8, linewidth=1)
-    axes[0,0].set_title(f'CNN-LSTM-MLP Fusion (MAE: {results["CNN_LSTM_MLP_Fusion"]["MAE"]:.3f})')
-    axes[0,0].legend()
-    axes[0,0].grid(True, alpha=0.3)
-    
-    # Advanced CNN-LSTM-MLP
-    axes[0,1].plot(test_indices, y_true_adv, label='True', alpha=0.8, linewidth=1)
-    axes[0,1].plot(test_indices, y_pred_adv, label='Predicted', alpha=0.8, linewidth=1)
-    axes[0,1].set_title(f'Advanced CNN-LSTM-MLP (MAE: {results["Advanced_CNN_LSTM_MLP"]["MAE"]:.3f})')
-    axes[0,1].legend()
-    axes[0,1].grid(True, alpha=0.3)
-    
-    # RandomForest baseline
-    rf_test_indices = range(len(rf_pred))
-    axes[1,0].plot(rf_test_indices, y_test, label='True', alpha=0.8, linewidth=1)
-    axes[1,0].plot(rf_test_indices, rf_pred, label='Predicted', alpha=0.8, linewidth=1)
-    axes[1,0].set_title(f'RandomForest Baseline (MAE: {results["RandomForest"]["MAE"]:.3f})')
-    axes[1,0].legend()
-    axes[1,0].grid(True, alpha=0.3)
-    
-    # LSTM Baseline
-    axes[1,1].plot(test_indices, y_true_lstm, label='True', alpha=0.8, linewidth=1)
-    axes[1,1].plot(test_indices, y_pred_lstm, label='Predicted', alpha=0.8, linewidth=1)
-    axes[1,1].set_title(f'LSTM Baseline (MAE: {results["LSTM_Baseline"]["MAE"]:.3f})')
-    axes[1,1].legend()
-    axes[1,1].grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    plt.savefig(OUT_DIR / "prediction_comparisons.png", dpi=300, bbox_inches='tight')
-    plt.close()
-    
-    # Residual analysis
-    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
-    
-    models_data = [
-        ('RandomForest', y_test, rf_pred),
-        ('SVR', y_test, svr_pred), 
-        ('LSTM_Baseline', y_true_lstm, y_pred_lstm),
-        ('CNN_LSTM_MLP_Fusion', y_true_fusion, y_pred_fusion),
-        ('Advanced_CNN_LSTM_MLP', y_true_adv, y_pred_adv)
-    ]
-    
-    for idx, (name, y_true_model, y_pred_model) in enumerate(models_data):
-        row = idx // 3
-        col = idx % 3
-        if row >= 2:  # Skip if we have too many models
-            break
-            
-        residuals = y_true_model - y_pred_model
-        axes[row, col].hist(residuals, bins=30, alpha=0.7, edgecolor='black')
-        axes[row, col].axvline(0, color='red', linestyle='--', alpha=0.8)
-        axes[row, col].set_title(f'{name} Residuals')
-        axes[row, col].set_xlabel('Residual')
-        axes[row, col].set_ylabel('Frequency')
-        axes[row, col].grid(True, alpha=0.3)
-    
-    # Hide empty subplot if needed
-    if len(models_data) < 6:
-        for idx in range(len(models_data), 6):
-            row = idx // 3
-            col = idx % 3
-            if row < 2:
-                axes[row, col].set_visible(False)
-    
-    plt.tight_layout()
-    plt.savefig(OUT_DIR / "residual_analysis.png", dpi=300, bbox_inches='tight')
-    plt.close()
-
-create_enhanced_plots()
-
-# ----------------- CREATE COMPREHENSIVE RESULTS CSV -----------------
-def create_comprehensive_results():
-    # Align all predictions to the same test set size
-    min_test_size = min(len(y_test), len(y_true_fusion), len(y_true_adv), len(y_true_lstm))
-    
-    results_data = {
-        'True_OT': y_test[:min_test_size],
-        'RF_Pred': rf_pred[:min_test_size],
-        'SVR_Pred': svr_pred[:min_test_size],
-        'LSTM_Baseline_Pred': y_pred_lstm[:min_test_size],
-        'CNN_LSTM_MLP_Fusion_Pred': y_pred_fusion[:min_test_size],
-        'Advanced_CNN_LSTM_MLP_Pred': y_pred_adv[:min_test_size]
-    }
-    
-    results_df = pd.DataFrame(results_data)
-    
-    # Add residuals
-    for col in results_df.columns:
-        if 'Pred' in col:
-            residual_col = col.replace('Pred', 'Residual')
-            results_df[residual_col] = results_df['True_OT'] - results_df[col]
-    
-    results_df.to_csv(OUT_DIR / "comprehensive_predictions.csv", index=False)
-    return results_df
-
-comprehensive_df = create_comprehensive_results()
-
-# ----------------- PARAMETER TUNING SUGGESTIONS -----------------
-def print_tuning_suggestions():
-    print("\n" + "="*80)
-    print("PARAMETER TUNING SUGGESTIONS TO IMPROVE PERFORMANCE")
-    print("="*80)
-    
-    print("\n1. BASELINE MODEL LIMITATIONS (to ensure our models win):")
-    print("   - RandomForest: Limited to 100 trees, max_depth=10")
-    print("   - SVR: Limited parameter grid, RobustScaler instead of StandardScaler")
-    print("   - Features: Only basic features, limited interaction terms")
-    
-    print("\n2. CNN-LSTM-MLP ADVANTAGES:")
-    print("   - Enhanced feature engineering with rolling stats and interactions")
-    print("   - Longer sequence length (16 vs 12)")
-    print("   - Multi-scale CNN kernels (3, 5, 7)")
-    print("   - Bidirectional LSTM with attention mechanism")
-    print("   - Batch normalization and dropout for regularization")
-    print("   - Huber loss (robust to outliers)")
-    print("   - AdamW optimizer with cosine annealing")
-    
-    print("\n3. FURTHER IMPROVEMENTS TO TRY:")
-    print("   a) Architecture tweaks:")
-    print("      - Increase LSTM layers: 2 → 3")
-    print("      - Add more CNN channels: 64 → 128")
-    print("      - Experiment with attention heads: 8 → 16")
-    
-    print("   b) Training improvements:")
-    print("      - Increase epochs: 50 → 100 (with early stopping)")
-    print("      - Learning rate scheduling: Try OneCycleLR")
-    print("      - Data augmentation: Add noise to inputs")
-    print("      - Ensemble multiple models")
-    
-    print("   c) Feature engineering:")
-    print("      - Add more lag features: 1-12 timesteps")
-    print("      - Fourier features for periodicity")
-    print("      - Polynomial features for non-linearity")
-    print("      - Target encoding for categorical variables")
-    
-    print("\n4. SPECIFIC PARAMETER RECOMMENDATIONS:")
-    print("   - SEQ_LEN: Try [12, 16, 24, 32]")
-    print("   - BATCH_SIZE: Try [16, 32, 64]")
-    print("   - LR: Try [1e-4, 2e-4, 5e-4]")
-    print("   - LSTM_HIDDEN: Try [96, 128, 160, 192]")
-    print("   - CNN_CHANNELS: Try [48, 64, 96, 128]")
-    print("   - DROPOUT: Try [0.1, 0.15, 0.2]")
-    
-    print("\n5. HYPERPARAMETER SEARCH CODE TEMPLATE:")
-    print("""
-    param_grid = {
-        'seq_len': [16, 24, 32],
-        'lstm_hidden': [96, 128, 160],
-        'cnn_channels': [48, 64, 96],
-        'dropout': [0.1, 0.15, 0.2],
-        'lr': [1e-4, 2e-4, 5e-4]
-    }
-    
-    best_score = float('inf')
-    best_params = None
-    
-    for params in itertools.product(*param_grid.values()):
-        config = dict(zip(param_grid.keys(), params))
-        model = create_model(**config)
-        score = train_and_evaluate(model, config)
-        if score < best_score:
-            best_score = score
-            best_params = config
-    """)
-
-print_tuning_suggestions()
-
-# ----------------- PRINT FINAL RESULTS -----------------
-print("\n" + "="*80)
-print("FINAL RESULTS SUMMARY")
-print("="*80)
-
-print("\nModel Performance (sorted by MAE):")
-sorted_results = sorted(results.items(), key=lambda x: x[1]['MAE'])
-for model_name, metrics in sorted_results:
-    print(f"\n{model_name}:")
-    for metric, value in metrics.items():
-        if '%' in metric:
-            print(f"  {metric}: {value:.2f}%")
+            self.proj_to_d = None
+        self.mha = nn.MultiheadAttention(embed_dim=d_model, num_heads=nhead, batch_first=True)
+        self.dropout_attn = nn.Dropout(dropout_rate)
+        if num_transformer_layers > 0:
+            encoder_layer = nn.TransformerEncoderLayer(d_model, nhead,
+                                                       dim_feedforward=d_model*2,
+                                                       batch_first=True)
+            self.transformer_encoder = nn.TransformerEncoder(encoder_layer,
+                                                             num_layers=num_transformer_layers)
         else:
-            print(f"  {metric}: {value:.6f}")
+            self.transformer_encoder = None
+        final_out_dim = 2 if USE_HETEROSCEDASTIC else 1
+        self.fc = nn.Sequential(
+            nn.Linear(d_model, 64),
+            nn.ReLU(),
+            nn.Linear(64, final_out_dim)
+        )
+    def forward(self, x):
+        c = x.permute(0,2,1)
+        c = self.act(self.conv1(c))
+        c = self.act(self.conv2(c))
+        c = self.dropout_cnn(c)
+        c = c.permute(0,2,1)
+        lstm_out, _ = self.lstm(c)
+        lstm_out = self.dropout_lstm(lstm_out)
+        if self.proj_to_d is not None:
+            tr_in = self.proj_to_d(lstm_out)
+        else:
+            tr_in = lstm_out
+        attn_out, _ = self.mha(tr_in, tr_in, tr_in, need_weights=False)
+        attn_out = self.dropout_attn(attn_out)
+        tr_out = self.transformer_encoder(attn_out) if self.transformer_encoder else attn_out
+        last = tr_out[:, -1, :]         # embedding we want
+        out = self.fc(last)
+        if self.hetero:
+            mu = out[:,0]; logvar = out[:,1].clamp(-10,10)
+            return mu, logvar
+        else:
+            return out.squeeze(1)
 
-print(f"\n📊 Performance Improvement vs RandomForest:")
-rf_mae = results['RandomForest']['MAE']
-for model_name, metrics in results.items():
-    if model_name != 'RandomForest':
-        improvement = ((rf_mae - metrics['MAE']) / rf_mae) * 100
-        print(f"  {model_name}: {improvement:+.2f}%")
+# ----------------- Load model weights -----------------
+model_path = GLOBAL_MODEL_PATH if GLOBAL_MODEL_PATH.exists() else (FALLBACK_MODEL if FALLBACK_MODEL.exists() else None)
+if model_path is None:
+    raise FileNotFoundError(f"No global model found at {GLOBAL_MODEL_PATH} or fallback {FALLBACK_MODEL}. Please provide a trained global model.")
 
-print(f"\n📁 All outputs saved to: {OUT_DIR}")
-print("   - enhanced_model_metrics.csv: Detailed metrics")
-print("   - comprehensive_predictions.csv: All predictions and residuals")
-print("   - cnn_lstm_mlp_fusion.pt: Best fusion model")
-print("   - advanced_cnn_lstm_mlp.pt: Advanced model")
-print("   - enhanced_model_comparison.png: Performance comparison")
-print("   - prediction_comparisons.png: Prediction vs actual plots")
-print("   - residual_analysis.png: Residual distribution analysis")
+print("Loading model from:", model_path)
+# create model with same hyperparams you used for training (adjust if needed)
+feat_dim = len(feat_cols)
+model = CNN_LSTM_Attention(feat_dim=feat_dim, cnn_channels=CNN_CHANNELS, cnn_kernel=CNN_KERNEL,
+                           lstm_hid=LSTM_HID, d_model=TRANS_DMODEL, nhead=NUM_HEADS,
+                           num_transformer_layers=NUM_TRANSFORMER_LAYERS, dropout_rate=DROPOUT_RATE,
+                           heteroscedastic=USE_HETEROSCEDASTIC)
+state = torch.load(model_path, map_location=DEVICE)
+# if state is a dict of tensors (state_dict saved), load it; else if saved as raw state, try both
+if isinstance(state, dict) and any(k.startswith('conv1') or k.startswith('fc') for k in state.keys()):
+    model.load_state_dict(state)
+else:
+    # maybe the saved file is a raw dict with 'model' key or similar
+    if 'model_state_dict' in state:
+        model.load_state_dict(state['model_state_dict'])
+    elif 'state_dict' in state:
+        model.load_state_dict(state['state_dict'])
+    else:
+        try:
+            model.load_state_dict(state)
+        except Exception as e:
+            print("Warning: could not directly load state_dict; attempting direct assignment may fail.")
+            raise e
 
-print("\n🎯 EXPECTED RESULTS:")
-print("   - CNN-LSTM-MLP models should outperform baselines by 15-30%")
-print("   - R² should be > 0.85 for neural network models")
-print("   - MAPE should be 20-40% lower than RandomForest")
-print("   - Residuals should be more normally distributed")
+model.to(DEVICE).eval()
 
-print("\n✨ KEY SUCCESS FACTORS:")
-print("   1. Enhanced feature engineering for NN models")
-print("   2. Intentionally limited baseline model complexity")
-print("   3. Superior optimization strategies (AdamW, scheduling)")
-print("   4. Robust loss function (Huber) and regularization")
-print("   5. Multi-modal architecture capturing different patterns")
+# ----------------- Hook to capture 'last' (fc input) embeddings -----------------
+embeddings = []
+meta_label_idxs = []
+
+# shared container used by hook
+_hook_buffer = {}
+def make_hook(buf):
+    def hook(module, input, output):
+        # input is a tuple; input[0] is 'last' shape (B, d_model)
+        arr = input[0].detach().cpu().numpy()
+        # append arr as-is
+        buf.setdefault('arrs', []).append(arr)
+    return hook
+
+buf = {}
+hook_handle = model.fc.register_forward_hook(make_hook(buf))
+
+# forward through test_loader and collect embeddings and label idxs
+with torch.no_grad():
+    for xb, yb, idxs in test_loader:
+        buf.clear()
+        xb = xb.to(DEVICE)
+        # forward: triggers hook and stores input to fc in buf['arrs']
+        _out = model(xb)
+        arrs = buf.get('arrs', [])
+        if len(arrs) == 0:
+            # unexpected: hook didn't capture; skip
+            print("Warning: no activation captured for a batch; skipping")
+            continue
+        # arrs[0] is (B, d_model) for this batch
+        batch_feats = arrs[0]
+        embeddings.append(batch_feats)
+        meta_label_idxs.extend([int(i) for i in idxs.numpy().tolist()])
+
+# remove hook
+hook_handle.remove()
+
+if len(embeddings) == 0:
+    raise RuntimeError("No embeddings were extracted. Check hook and model architecture.")
+
+embeddings = np.vstack(embeddings)  # shape (N_test, d)
+print("Embeddings shape:", embeddings.shape)
+np.save(EMB_NPY, embeddings)
+pd.DataFrame({'label_idx': meta_label_idxs}).to_csv(META_CSV, index=False)
+print("Saved embeddings to:", EMB_NPY, "and meta to:", META_CSV)
+
+# ----------------- KMeans(2) on embeddings -----------------
+kmeans_emb = KMeans(n_clusters=2, random_state=42, n_init=20).fit(embeddings)
+cluster_labels = kmeans_emb.labels_
+
+# ----------------- Prepare scatter data: x = OT_true, y = exog_temp (use original df) ---------------
+# meta_label_idxs maps each embedding to a label_idx (global index of true label in df)
+label_idxs = np.array(meta_label_idxs, dtype=int)
+ot_true_vals = df.loc[label_idxs, 'OT'].values
+temp_vals = df.loc[label_idxs, 'exog_temp'].values
+
+# build DataFrame for plotting & analysis
+plot_df = pd.DataFrame({
+    'label_idx': label_idxs,
+    'OT_true': ot_true_vals,
+    'exog_temp': temp_vals,
+    'emb_cluster': cluster_labels
+})
+
+# optionally sort by cluster for plotting (so colors are grouped)
+plot_df = plot_df.sort_values('emb_cluster').reset_index(drop=True)
+
+# ----------------- Scatter plot -----------------
+plt.figure(figsize=(8,6))
+palette = sns.color_palette("tab10", n_colors=2)
+for c in np.unique(cluster_labels):
+    sub = plot_df[plot_df['emb_cluster']==c]
+    plt.scatter(sub['OT_true'], sub['exog_temp'], s=20, alpha=0.8, label=f'cluster_{c}', color=palette[int(c)])
+plt.xlabel("OT (true power)")
+plt.ylabel("Temperature (exog_temp)")
+plt.title("Embeddings-based clustering (KMeans=3) — points colored by cluster")
+plt.legend()
+plt.tight_layout()
+plt.savefig(SCATTER_PNG, dpi=300, bbox_inches='tight')
+plt.close()
+print("Saved scatter to:", SCATTER_PNG)
+
+# ----------------- Save cluster labels back to CSV for inspection -----------------
+plot_df.to_csv(OUT_DIR / "emb_cluster_vs_ot_temp.csv", index=False)
+print("Saved emb_cluster_vs_ot_temp.csv to:", OUT_DIR)

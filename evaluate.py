@@ -1,7 +1,7 @@
 import pandas as pd
 
 # 读取实验结果
-df = pd.read_csv("out_cnn_lstm_grid_search_2/grid_search_results_partial.csv")
+df = pd.read_csv("out_cnn_lstm_grid_search_3/grid_search_results_partial.csv")
 
 # 定义综合评分（越小越好）
 df["score"] = df["NRMSE"] + (1 - df["R2"]) * 100 + df["MASE"]

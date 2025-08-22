@@ -171,7 +171,7 @@ df['cluster_label'] = df['cluster'].map(label_map)
 results = {}
 # 
 # RandomForest
-rf = RandomForestRegressor(n_estimators=25, random_state=SEED, n_jobs=-1)
+rf = RandomForestRegressor(n_estimators=10, random_state=SEED, n_jobs=-1)
 rf.fit(X_train_cl_s, y_train)
 rf_pred = rf.predict(X_test_cl_s)
 results['RandomForest'] = metric_table(y_test, rf_pred)
@@ -202,8 +202,7 @@ best_svr_pipe.fit(X_train_plus_val, y_train_plus_val)
 svr_pred = best_svr_pipe.predict(X_test_cl)
 joblib.dump((best_svr_pipe, feature_cols_classical), OUT_DIR/"svr_model.joblib")
 
-
-
+results['SVR'] = metric_table(y_test, svr_pred)
 # (Optional) LightGBM could be added here if installed
 
 # ----------------- SEQUENCE DATASETS FOR NN MODELS -----------------

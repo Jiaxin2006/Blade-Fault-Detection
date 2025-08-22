@@ -36,24 +36,24 @@ import torch.optim as optim
 # ------------------ CONFIG ------------------
 SEED = 520
 random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
-
-OUT_DIR = Path("out_cnn_lstm_att_cluster_val")
+N_CLUSTERS = 1
+OUT_DIR = Path(f"out_cnn_lstm_cluster_{N_CLUSTERS}")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 # 数据/模型超参
-SEQ_LEN = 32                 # 输入序列长度
+SEQ_LEN = 4                 # 输入序列长度
 BATCH_SIZE = 16
 LR = 3e-4
 EPOCHS = 40
 EARLY_STOPPING_PATIENCE = 7
-DROPOUT_RATE = 0.1
+DROPOUT_RATE = 0.0
 
 CNN_CHANNELS = 16
 CNN_KERNEL = 3
 LSTM_HID = 128
 TRANS_DMODEL = 128
 NUM_HEADS = 4
-NUM_TRANSFORMER_LAYERS = 1
+NUM_TRANSFORMER_LAYERS = 0
 
 VAL_RATIO = 0.10             # VERY IMPORTANT: 验证集不为0
 TEST_RATIO = 0.20
@@ -61,15 +61,16 @@ TEST_RATIO = 0.20
 # 训练策略/损失 可选开关
 USE_HETEROSCEDASTIC = True  # True: 输出 (mu, logvar) + Gaussian NLL
 USE_ASYMMETRIC_LOSS = True    # True: 低估加重惩罚
-ASYM_UNDER_WEIGHT = 3.0       # 低估惩罚倍数（diff<0）
-OVERSAMPLE_PEAKS = True       # True: 训练集对峰值过采样
+ASYM_UNDER_WEIGHT = 2.0       # 低估惩罚倍数（diff<0）
+OVERSAMPLE_PEAKS = False      # True: 训练集对峰值过采样
 PEAK_PERCENTILE = 95          # 以训练集label的95分位作为峰值阈值
 PEAK_WEIGHT_ALPHA = 2.0       # 过采样时峰值样本权重
 
 PATIENCE = 3                  # 学习率调度等待
 LR_FACTOR = 0.5
 
-LOSS_TYPE = "null"   # 可选: "mae", "mse", "huber", "mape", "smape"
+
+LOSS_TYPE = "smape"   # 可选: "mae", "mse", "huber", "mape", "smape"
 '''
 huber + val-null:
 Test metrics: {'MAE': 100.61695098876953, 'MSE': 32492.36328125, 'RMSE': 180.25638208188357, 'MAPE(%)': np.float32(32.205048)}
@@ -175,10 +176,10 @@ test_df  = df.iloc[train_size + val_size:].reset_index(drop=True)
 print("Train/Val/Test sizes:", len(train_df), len(val_df), len(test_df))
 
 # ------------------ Clustering (fit on TRAIN to avoid leakage) ------------------
-cluster_features = ['exog_temp','OT_prev']
+cluster_features = ['exog_temp','exog_wind','OT_prev']
 scaler_cluster = StandardScaler().fit(train_df[cluster_features].values)
 Xc_train = scaler_cluster.transform(train_df[cluster_features].values)
-kmeans = KMeans(n_clusters=2, random_state=SEED, n_init=20).fit(Xc_train)
+kmeans = KMeans(n_clusters=N_CLUSTERS, random_state=SEED, n_init=20).fit(Xc_train)
 
 # 给全数据打cluster标签（使用train拟合的scaler/kmeans）
 Xc_full = scaler_cluster.transform(df[cluster_features].values)
@@ -259,7 +260,7 @@ test_start, test_end   = train_size + val_size, n - 1
 train_loaders, val_loaders = {}, {}
 peak_thresholds = {}
 
-for cluster_id in [0, 1]:
+for cluster_id in range(N_CLUSTERS):
     train_ds = ClusterSeqDataset(df_scaled, train_start, train_end, SEQ_LEN, feat_cols, cluster_id)
     val_ds   = ClusterSeqDataset(df_scaled, val_start,   val_end,   SEQ_LEN, feat_cols, cluster_id)
 
@@ -369,7 +370,7 @@ def asymmetric_mse(pred, y, under_weight=ASYM_UNDER_WEIGHT):
 models = {}
 history = {}
 
-for cluster_id in [0, 1]:
+for cluster_id in range(N_CLUSTERS):
     feat_dim = len(feat_cols)
     model = CNN_LSTM_Attention(feat_dim=feat_dim, cnn_channels=CNN_CHANNELS, cnn_kernel=CNN_KERNEL,
                                lstm_hid=LSTM_HID, d_model=TRANS_DMODEL, nhead=NUM_HEADS,
